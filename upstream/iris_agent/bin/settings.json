@@ -1,0 +1,10 @@
+{
+  "hooks": {},
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep"
+    ]
+  }
+}

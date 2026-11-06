@@ -1,0 +1,91 @@
+// iris_benchmark.hhl
+//
+// Case study: benchmark the Iris agent on Admitted lemmas.
+//
+// Flow:
+//   1. Grep for Admitted. lines with line numbers
+//   2. Ask LLM to read the file and extract lemma names for those lines
+//   3. Validate count matches grep count, retry once if not
+//   4. For each lemma: call the iris_agent's prove workflow
+
+require iris_agent from "iris_agent.hhl";
+
+python import iris_benchmark_ext;
+
+allowed_tools = ["Read", "Glob", "Grep", "Bash"]
+
+// --- Workflow ---
+
+workflow benchmark(file_path: string) {
+    let project_dir = config["iris_dir"]
+    // Step 1: Grep for Admitted. lines
+    print("Extracting Admitted lemmas from " ++ file_path ++ "...")
+    let grep_result = call iris_benchmark_ext.grep_admitted(project_dir ++ "/" ++ file_path)
+    let expected = call iris_benchmark_ext.count_lines(grep_result)
+    var session = ""
+    let rws = open at project_dir
+
+    // Step 2: Ask LLM to extract lemma names
+    let r = invoke(rws,
+        "Read " ++ file_path ++ ". Here are the line numbers containing Admitted.:\n" ++ grep_result ++ "\nFor each line, find the enclosing lemma/theorem/definition name. Output ONLY the names, one per line.",
+        system_prompt = config["iris_benchmark_system_prompt"],
+        max_turns = config["iris_benchmark_max_turns"]
+    )
+
+    if r.is_error {
+        print("Failed to extract lemmas: " ++ r.result)
+    } else {
+        var lemmas = call iris_benchmark_ext.parse_lemma_list(r.result)
+        let got = call iris_benchmark_ext.list_length(lemmas)
+
+        // Step 3: If count doesn't match, retry once
+        if got != expected {
+            print("Count mismatch: expected " ++ to_string(expected) ++ " but got " ++ to_string(got) ++ ". Retrying...")
+            let r2 = invoke(rws,
+                "You returned " ++ to_string(got) ++ " lemma names but there are " ++ to_string(expected) ++ " Admitted. lines. Please re-read " ++ file_path ++ " and output ALL " ++ to_string(expected) ++ " names, one per line.",
+                r.session_id,
+                system_prompt = config["iris_benchmark_system_prompt"],
+                max_turns = config["iris_benchmark_max_turns"]
+            )
+            if not(r2.is_error) {
+                lemmas = call iris_benchmark_ext.parse_lemma_list(r2.result)
+            }
+        }
+
+        print("Found lemmas:")
+        for lemma in lemmas {
+            print("  - " ++ lemma)
+        }
+        print("========================================")
+
+        // Step 4: Prove each lemma, restart session every 6
+        var count = 0
+        for lemma in lemmas {
+            print("========================================")
+            print("Proving: " ++ lemma)
+            print("========================================")
+
+            let prompt = "Use the Edit tool to replace the Admitted. after lemma " ++ lemma ++ " in " ++ file_path ++ " with your proof ending in Qed. Do NOT just print the proof as text — you MUST use the Edit tool to modify the file. I will verify the file after you edit it."
+            let new_session = run iris_agent.prove(prompt, session)
+            session = new_session
+            count = count + 1
+
+            if count % 6 == 0 {
+                print("  [Resetting session after 6 lemmas]")
+                session = ""
+            }
+
+            call iris_benchmark_ext.pause_check()
+        }
+
+        print("========================================")
+        print("File complete: " ++ file_path)
+    }
+}
+
+// Thin wrapper so iris_project.hhl can dispatch a single fix without
+// re-requiring iris_agent (avoids the loom dedup bug for transitive requires).
+workflow fix_one(prompt: string, session_id: string) {
+    let s = run iris_agent.prove(prompt, session_id)
+    return s
+}

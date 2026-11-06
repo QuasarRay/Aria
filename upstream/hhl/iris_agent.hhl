@@ -1,0 +1,105 @@
+// iris_agent.hhl
+//
+// An agent that proves Coq lemmas in the Iris separation logic library.
+//
+// Iris is a higher-order concurrent separation logic framework.
+// It uses dune for building (no nix). Coq commands can run directly.
+//
+// Flow:
+//   1. User provides a prompt (e.g. "prove lemma X in file Y")
+//   2. Claude reads the file, writes a proof
+//   3. Pre-hooks block: Admitted
+//   4. Post-turn hook: runs coq_check.py which uses dune build to verify,
+//      and on failure uses "dune coq top" to show the goal at the error line
+//   5. If verification fails, retry up to 3 times with error + goal context
+
+python import iris_agent_ext;
+
+// --- Hook declarations ---
+
+hook no_admitted: Write(file, original) = iris_agent_ext.no_admitted_fn
+hook lint: Write(file, original) = iris_agent_ext.lint_fn
+hook safe_command: Bash(cmd) = iris_agent_ext.safe_command_fn
+hook verify_proof: Turn(files) = iris_agent_ext.verify_proof_fn
+
+// --- Workspace ---
+// The Iris separation logic library.
+// Uses dune build system, no nix required.
+
+allowed_tools = ["Read", "Glob", "Grep", "Bash", "Write", "Edit"]
+
+// --- Workflow ---
+// 1. First attempt: invoke Claude with the user prompt
+// 2. If verify_proof fails: retry up to 3 times with error + goal context
+// 3. Each retry resumes the same session so Claude has full context
+
+workflow prove(prompt: string, session_id: string) {
+    let project_dir = config["iris_dir"]
+    let timer = call iris_agent_ext.start_timer()
+    var last_error = ""
+    var last_session = session_id
+    var success = false
+    let iws = open at project_dir
+
+    call iris_agent_ext.check_schedule()
+    let r = invoke(iws, prompt, session_id,
+        pre = [no_admitted, lint, safe_command],
+        post = [verify_proof],
+        system_prompt = config["iris_agent_system_prompt"],
+        max_turns = config["iris_agent_max_turns"],
+        verbose = config["iris_agent_verbose"]
+    )
+
+    if r.is_error {
+        last_error = r.result
+        last_session = r.session_id
+    } else {
+        success = true
+    }
+
+    var attempt = 0
+    while not(success) and attempt < 30 {
+        attempt = attempt + 1
+        print("Retry " ++ to_string(attempt) ++ ": " ++ last_error)
+        let r2 = invoke(iws,
+            "The proof failed. Here is the error and the goal at the failing point:\n" ++ last_error ++ "\nPlease fix the proof.",
+            last_session,
+            pre = [no_admitted, lint, safe_command],
+            post = [verify_proof],
+            system_prompt = config["iris_agent_system_prompt"],
+            max_turns = config["iris_agent_max_turns"],
+            verbose = config["iris_agent_verbose"]
+        )
+
+        if r2.is_error {
+            last_error = r2.result
+            last_session = r2.session_id
+        } else {
+            success = true
+        }
+    }
+
+    let duration = call iris_agent_ext.elapsed(timer)
+
+    if success {
+        print("Done")
+        call iris_agent_ext.record_result(prompt, project_dir, "proved", duration, attempt)
+    } else {
+        // Give up: ask Claude to add a failure comment and Admitted. back
+        // so the project still compiles. No no_admitted hook here.
+        print("Failed after 30 retries. Adding Admitted. back...")
+        let r3 = invoke(iws,
+            "I could not prove this lemma after many attempts. Please add a comment explaining the last error:\n"
+            ++ last_error
+            ++ "\nThen put Admitted. back so the project still compiles.",
+            last_session,
+            pre = [safe_command],
+            system_prompt = config["iris_agent_system_prompt"],
+            max_turns = config["iris_agent_max_turns"],
+            verbose = config["iris_agent_verbose"]
+        )
+        call iris_agent_ext.record_result(prompt, project_dir, "failed", duration, attempt)
+    }
+
+    return last_session
+}

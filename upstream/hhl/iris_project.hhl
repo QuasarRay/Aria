@@ -1,0 +1,144 @@
+// iris_project.hhl
+//
+// Project-level benchmark.
+//
+// Phase 0 (always on, looped until convergence): build the project; if it
+//   fails, ask the LLM to extract the list of broken proofs as JSON, dispatch
+//   each to iris_agent.prove for repair, then rebuild. Repeat up to 20 rounds.
+//   Coq stops at the first error per file, so a single file with N broken
+//   proofs needs N rounds to expose them all.
+//   Aborts on non-proof errors or persistent extraction-count mismatch.
+// Phase 1: find every .v file with Admitted., prove each lemma.
+
+require iris_benchmark from "iris_benchmark.hhl";
+
+python import iris_project_ext;
+
+// Used for the LLM extraction step of Phase 0. Read-only; needs Read/Glob/Grep
+// to look up enclosing lemma names from build error locations.
+allowed_tools = ["Read", "Glob", "Grep"]
+
+// --- Workflow ---
+
+workflow run_project() {
+    let project_dir = config["iris_dir"]
+    // Phase 0: build & fix loop. Iterates because Coq only reports the first
+    // error per file, so multi-error files need multiple build/fix rounds.
+    print("########################################")
+    print("Phase 0: build & fix broken proofs (looped)")
+    print("########################################")
+
+    let pws = open at project_dir
+    var build_clean = false
+    var round = 0
+    while not(build_clean) and round < 20 {
+        round = round + 1
+        print("")
+        print("--- Phase 0 round " ++ to_string(round) ++ " ---")
+        let build_out = call iris_project_ext.dune_build_capture(project_dir)
+
+        if build_out == "OK" {
+            build_clean = true
+        } else {
+            let expected = call iris_project_ext.count_coq_errors(build_out)
+            print("Build reports " ++ to_string(expected) ++ " Coq error(s). Asking LLM to extract details (JSON)...")
+
+            var attempt = 0
+            var got = 0 - 1
+            var last_text = ""
+            while got != expected and attempt < 3 {
+                attempt = attempt + 1
+                let r = invoke(pws,
+                    "Here is the dune build output:\n----------\n" ++ build_out ++ "\n----------\nFor each Coq Error, output one JSON object with keys file, line, lemma, error. Output a JSON array of exactly " ++ to_string(expected) ++ " objects. No markdown, no preamble. Use Read to look up the enclosing lemma name in the source file when the error context does not name it. If an error is outside any proof body, set lemma to the literal string NONE.",
+                    system_prompt = config["iris_project_system_prompt"],
+                    max_turns = config["iris_project_max_turns"]
+                )
+                if r.is_error {
+                    print("LLM extraction call failed: " ++ r.result)
+                    return ()
+                }
+                last_text = r.result
+                let parsed_now = call iris_project_ext.parse_extracted(r.result)
+                got = call iris_project_ext.list_length(parsed_now)
+                if got != expected {
+                    print("Attempt " ++ to_string(attempt) ++ ": got " ++ to_string(got) ++ " entries, expected " ++ to_string(expected) ++ ". Retrying...")
+                }
+            }
+
+            if got != expected {
+                print("ERROR: could not extract a consistent error list after 3 attempts. Aborting Phase 0.")
+                print("Raw build output:")
+                print(build_out)
+                return ()
+            }
+
+            let entries = call iris_project_ext.parse_extracted(last_text)
+            let has_non_proof = call iris_project_ext.has_non_proof_error(entries)
+            if has_non_proof {
+                print("Non-proof error detected in build output. Please fix manually before re-running:")
+                print(build_out)
+                return ()
+            }
+
+            print("Fixing " ++ to_string(expected) ++ " broken proof(s) this round...")
+            var fix_session = ""
+            var fixed = 0
+            for entry in entries {
+                let file = call iris_project_ext.entry_file(entry)
+                let lemma = call iris_project_ext.entry_lemma(entry)
+                let err = call iris_project_ext.entry_error(entry)
+                print("========================================")
+                print("Fixing: lemma " ++ lemma ++ " in " ++ file)
+                print("Error: " ++ err)
+                print("========================================")
+                let fix_prompt = "The proof of lemma " ++ lemma ++ " in " ++ file ++ " is failing to compile with this error:\n" ++ err ++ "\nUse the Edit tool to fix the proof. End with Qed."
+                let s = run iris_benchmark.fix_one(fix_prompt, fix_session)
+                fix_session = s
+                fixed = fixed + 1
+                if fixed % 6 == 0 {
+                    fix_session = ""
+                }
+            }
+            print("Round " ++ to_string(round) ++ " done — " ++ to_string(fixed) ++ " fix(es). Rebuilding...")
+        }
+    }
+
+    if not(build_clean) {
+        print("Phase 0 did not converge after 20 rounds. Aborting before Phase 1.")
+        return ()
+    }
+
+    print("Phase 0: project builds clean.")
+
+    // Phase 1: find Admitted lemmas and prove them.
+    print("")
+    print("########################################")
+    print("Phase 1: find & prove Admitted lemmas")
+    print("########################################")
+    let files = call iris_project_ext.find_admitted_files(project_dir)
+
+    print("Files with Admitted lemmas:")
+    for file in files {
+        print("  " ++ file)
+    }
+    print("========================================")
+
+    for file in files {
+        print("")
+        print("########################################")
+        print("Processing: " ++ file)
+        print("########################################")
+
+        run iris_benchmark.benchmark(file)
+
+        let build_ok = call iris_project_ext.run_dune_build(project_dir)
+        if not(build_ok) {
+            print("WARNING: dune build failed after processing " ++ file)
+        }
+    }
+
+    print("")
+    print("########################################")
+    print("Project benchmark complete")
+    print("########################################")
+}
