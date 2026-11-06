@@ -31,7 +31,6 @@ jobs:
         run: python mirror/pipeline.py test
 
   mirror:
-    if: github.event_name != 'push'
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 50
