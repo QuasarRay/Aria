@@ -1,0 +1,5 @@
+.mirror-stage/
+.upstream-replacement/
+__pycache__/
+*.py[cod]
+.venv/
